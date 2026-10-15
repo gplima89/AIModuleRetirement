@@ -22,11 +22,22 @@ For every accessible tenant and subscription (or the ones you specify), the scri
 
 ## Prerequisites
 
-- **PowerShell 7+** (Windows PowerShell 5.1 also works).
-- **PowerShell modules** (auto-installed to your user scope on first run if missing):
+- **PowerShell 5.1+** (PowerShell 7+ recommended). Checked automatically on every run.
+- **PowerShell modules** (checked and auto-installed to your user scope on first run if missing):
   `Az.Accounts`, `Az.CognitiveServices`, `Az.ResourceGraph`, `Az.Resources`, `Az.Monitor`, `ImportExcel`
-- An active **Azure sign-in** (`Connect-AzAccount` or `az login`) — the script reuses your existing session and credentials. No secrets are stored or required.
+- An active **Azure sign-in** (`Connect-AzAccount` or `az login`) — the script reuses your existing session and credentials, or prompts you to sign in interactively if none is found. No secrets are stored or required.
 - **Reader** access (or higher) on the subscriptions/tenants you want scanned, and **Monitoring Reader** (or higher) on each Cognitive Services account if you want token-usage data (otherwise those columns report `0`).
+
+### Pre-flight checks
+
+Every run starts with a pre-flight validation pass that fails fast with an actionable message instead of partway through a long scan:
+
+1. **PowerShell version** — must be 5.1 or later.
+2. **Required modules** — presence, auto-install (CurrentUser scope), and import; every missing/broken module is reported together, not just the first one.
+3. **Azure sign-in** — reuses an existing session or launches `Connect-AzAccount` interactively; fails clearly if sign-in doesn't succeed.
+4. **Minimal access check** — confirms the signed-in account can enumerate at least one Entra ID tenant before the scan begins.
+
+Per-subscription (Reader) and per-account (Monitoring Reader) access gaps discovered *during* the scan are reported as warnings and skipped, not fatal errors — see [Notes & limitations](#notes--limitations).
 
 ## Getting started
 
@@ -89,6 +100,7 @@ Get-Help .\Get-AIFoundryInventory.ps1 -Full
 - Token usage is read directly from the `Microsoft.Insights/metrics` REST API (not `Get-AzMetric`, which has a known bug for this metric/dimension combination in some `Az.Monitor` versions).
 - Accounts/kinds that don't emit the `TotalTokens` metric (e.g. `ContentSafety`) simply report `0` for all weeks instead of erroring.
 - The Azure Monitor dimension-split query returns up to 500 series per account (`&top=500`), which comfortably covers typical deployment counts per account.
+- The script does not inspect your Azure RBAC role assignments up front; access gaps (missing Reader/Monitoring Reader) are instead discovered organically per tenant/subscription/account and reported as warnings with the specific failure, so the scan keeps going instead of aborting.
 
 ## License
 

@@ -1,4 +1,7 @@
-#Requires -Modules Az.Accounts, Az.CognitiveServices, Az.ResourceGraph, Az.Resources, Az.Monitor, ImportExcel
+# NOTE: Deliberately no "#Requires -Modules" directive here. #Requires aborts the ENTIRE script before
+# any code runs if a listed module is missing, which would make the auto-install logic in the
+# "Pre-flight validation" region below unreachable. Module presence/version is validated and
+# auto-installed at runtime instead, with actionable error messages.
 <#
 .SYNOPSIS
     Inventories Azure AI Foundry / Azure OpenAI / Cognitive Services model deployments and Foundry
@@ -56,10 +59,13 @@
 
 .NOTES
     Requires: Az.Accounts, Az.CognitiveServices, Az.ResourceGraph, Az.Resources, Az.Monitor, ImportExcel
+             (auto-installed to CurrentUser scope if missing), PowerShell 5.1 or later (7+ recommended).
     Auth: reuses your existing Connect-AzAccount / az login session. If a tenant can't be queried with the
           current token, the script attempts Connect-AzAccount -Tenant <id> and otherwise skips it with a warning.
     Token usage requires "Monitoring Reader" (or higher) on each Cognitive Services account; accounts/kinds
     that don't emit the "TotalTokens" metric (e.g. ContentSafety) simply report 0 for all weeks.
+    Pre-flight checks performed before any scanning begins: PowerShell version, required module
+    presence/install/import, Azure sign-in, and that the signed-in account can enumerate at least one tenant.
 #>
 [CmdletBinding()]
 param(
@@ -73,22 +79,71 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-#region Module bootstrap
+#region Pre-flight validation
+Write-Host "Running pre-flight checks..." -ForegroundColor Cyan
+
+# 1. PowerShell version - Az modules and the syntax used in this script require 5.1+ (7+ recommended).
+$minPSVersion = [version]'5.1'
+if ($PSVersionTable.PSVersion -lt $minPSVersion) {
+    throw "Unsupported PowerShell version: $($PSVersionTable.PSVersion). This script requires PowerShell $minPSVersion or later (PowerShell 7+ recommended). Install PowerShell 7 from https://aka.ms/powershell-release-current and re-run this script with 'pwsh'."
+}
+Write-Host "  [OK] PowerShell version $($PSVersionTable.PSVersion) ($($PSVersionTable.PSEdition))" -ForegroundColor Green
+
+# 2. Required modules - install to CurrentUser scope if missing, then import. Collect failures so we can
+#    report every missing/broken module at once instead of stopping at the first one.
 $requiredModules = 'Az.Accounts', 'Az.CognitiveServices', 'Az.ResourceGraph', 'Az.Resources', 'Az.Monitor', 'ImportExcel'
+$moduleFailures = [System.Collections.Generic.List[string]]::new()
 foreach ($m in $requiredModules) {
     if (-not (Get-Module -ListAvailable -Name $m)) {
-        Write-Host "Installing missing module: $m" -ForegroundColor Yellow
-        Install-Module -Name $m -Scope CurrentUser -Force -AllowClobber -Repository PSGallery
+        Write-Host "  Module '$m' not found. Attempting installation to CurrentUser scope..." -ForegroundColor Yellow
+        try {
+            Install-Module -Name $m -Scope CurrentUser -Force -AllowClobber -Repository PSGallery -ErrorAction Stop
+        } catch {
+            $moduleFailures.Add("$m (install failed: $($_.Exception.Message))")
+            continue
+        }
     }
-    Import-Module -Name $m -ErrorAction Stop
+    try {
+        Import-Module -Name $m -ErrorAction Stop
+        Write-Host "  [OK] Module '$m' v$((Get-Module -Name $m).Version)" -ForegroundColor Green
+    } catch {
+        $moduleFailures.Add("$m (import failed: $($_.Exception.Message))")
+    }
 }
-#endregion
+if ($moduleFailures.Count -gt 0) {
+    throw "The following required module(s) could not be installed/imported:`n  - $($moduleFailures -join "`n  - ")`n`nTry installing manually with: Install-Module -Name <ModuleName> -Scope CurrentUser -Force"
+}
 
-#region Auth bootstrap
-if (-not (Get-AzContext)) {
-    Write-Host "No active Azure context found. Launching interactive login..." -ForegroundColor Yellow
-    Connect-AzAccount | Out-Null
+# 3. Azure authentication - reuse an existing session if present, otherwise prompt interactively.
+Write-Host "  Checking Azure sign-in..." -ForegroundColor Cyan
+$azContext = Get-AzContext
+if (-not $azContext -or -not $azContext.Account) {
+    Write-Host "  No active Azure session found. Launching interactive sign-in (Connect-AzAccount)..." -ForegroundColor Yellow
+    try {
+        Connect-AzAccount -ErrorAction Stop | Out-Null
+        $azContext = Get-AzContext
+    } catch {
+        throw "Azure sign-in failed: $($_.Exception.Message). Run 'Connect-AzAccount' manually and re-run this script."
+    }
 }
+if (-not $azContext -or -not $azContext.Account) {
+    throw "Unable to establish an authenticated Azure session. Run 'Connect-AzAccount' manually and re-run this script."
+}
+Write-Host "  [OK] Signed in as $($azContext.Account.Id) (home tenant: $($azContext.Tenant.Id))" -ForegroundColor Green
+
+# 4. Minimal access check - confirm the signed-in identity can actually enumerate at least one tenant.
+#    This catches cases like a disabled account, a token with no directory read access, or no network
+#    route to Azure AD before we spend time looping through tenants/subscriptions later in the script.
+try {
+    $preflightTenants = @(Get-AzTenant -ErrorAction Stop)
+} catch {
+    throw "Could not enumerate Entra ID tenants for the signed-in account ($($azContext.Account.Id)): $($_.Exception.Message). Confirm you are signed in with the correct account, have network access to Azure, and have at least Reader access to an Azure subscription."
+}
+if ($preflightTenants.Count -eq 0) {
+    throw "The signed-in account ($($azContext.Account.Id)) has no accessible Entra ID tenants. Confirm you are signed in with the correct account and have at least Reader access to an Azure subscription."
+}
+Write-Host "  [OK] $($preflightTenants.Count) accessible tenant(s) detected for this account" -ForegroundColor Green
+Write-Host "  Note: per-subscription access (Reader) and per-account Monitoring Reader (for token usage) are validated as each resource is scanned; any gaps are reported as warnings, not fatal errors." -ForegroundColor DarkGray
 #endregion
 
 #region Helpers
@@ -222,8 +277,8 @@ function Get-AccountWeeklyTokenUsage {
 #endregion
 
 #region Determine tenants to scan
-Write-Host "Discovering accessible tenants..." -ForegroundColor Cyan
-$allTenants = Get-AzTenant | Select-Object @{n = 'Id'; e = { $_.Id } }, @{n = 'Name'; e = { $_.Name } }
+# Reuses the tenant list already fetched during pre-flight validation above - no need to call Get-AzTenant again.
+$allTenants = $preflightTenants | Select-Object @{n = 'Id'; e = { $_.Id } }, @{n = 'Name'; e = { $_.Name } }
 if ($TenantId) {
     $tenantsToScan = $TenantId | ForEach-Object {
         $tid = $_
@@ -257,7 +312,7 @@ foreach ($tenant in $tenantsToScan) {
             Connect-AzAccount -Tenant $tId -ErrorAction Stop | Out-Null
             $subs = Get-AzSubscription -TenantId $tId -ErrorAction Stop
         } catch {
-            Write-Warning "Skipping tenant $tId - unable to authenticate or list subscriptions: $($_.Exception.Message)"
+            Write-Warning "Skipping tenant $tId - unable to authenticate or list subscriptions: $($_.Exception.Message). This usually means the signed-in account has no role assignment (e.g. Reader) in this tenant."
             continue
         }
     }
@@ -282,7 +337,7 @@ foreach ($tenant in $tenantsToScan) {
     try {
         $aiResources = Invoke-FullGraphQuery -Query $graphQuery -Subscription $subs.Id
     } catch {
-        Write-Warning "Resource Graph query failed in tenant $tId - $($_.Exception.Message)"
+        Write-Warning "Resource Graph query failed in tenant $tId - $($_.Exception.Message). Confirm the signed-in account has at least Reader access on these subscription(s)."
         continue
     }
 
@@ -324,7 +379,7 @@ foreach ($tenant in $tenantsToScan) {
             # add an extra array layer and break per-item enumeration below for multi-deployment accounts.
             $deployments = Get-AzCognitiveServicesAccountDeployment -ResourceGroupName $acct.resourceGroup -AccountName $acct.name -ErrorAction Stop
         } catch {
-            Write-Warning "    Could not list deployments for account $($acct.name): $($_.Exception.Message)"
+            Write-Warning "    Could not list deployments for account $($acct.name): $($_.Exception.Message). Confirm the signed-in account has at least Cognitive Services Reader on this account."
             $deployments = [System.Collections.Generic.List[object]]::new()
         }
 
