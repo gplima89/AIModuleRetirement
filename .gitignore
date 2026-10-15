@@ -1,0 +1,7 @@
+# Generated Excel reports from Get-AIFoundryInventory.ps1
+AI-Foundry-Inventory-*.xlsx
+
+# OS/editor cruft
+.DS_Store
+Thumbs.db
+*.swp
