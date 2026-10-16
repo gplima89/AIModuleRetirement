@@ -522,7 +522,7 @@ if ($deploymentResults.Count -gt 0) {
         Export-Excel -Path $OutputPath -WorksheetName 'Model Deployments' -AutoSize -FreezeTopRow -BoldTopRow -AutoFilter -TableStyle Medium2 `
             -ConditionalText @($ctRetired, $ctSoon, $ctDeprecating, $ctLegacy, $ctUnknown, $ctOk) -PassThru
 
-    # Add a color scale over the weekly/total token columns so high-volume (high-impact) deployments stand out.
+    # Use fixed token bands so colors are consistent across weekly/total columns and reports.
     $ws = $excelPkg.Workbook.Worksheets['Model Deployments']
     $lastRow = $ws.Dimension.End.Row
     $lastCol = $ws.Dimension.End.Column
@@ -532,7 +532,16 @@ if ($deploymentResults.Count -gt 0) {
             for ($c = 1; $c -le $lastCol; $c++) {
                 if ($ws.Cells[1, $c].Text -eq $colName) {
                     $colLetter = ([OfficeOpenXml.ExcelCellAddress]::new(1, $c).Address) -replace '\d', ''
-                    Add-ConditionalFormatting -Worksheet $ws -Address "$($colLetter)2:$($colLetter)$lastRow" -RuleType ThreeColorScale
+                    $address = "$($colLetter)2:$($colLetter)$lastRow"
+                    $cell = "$($colLetter)2"
+                    Add-ConditionalFormatting -Worksheet $ws -Address $address -RuleType Expression `
+                        -ConditionValue "=AND(ISNUMBER($cell),$cell>=0,$cell<=50000)" -BackgroundColor ([System.Drawing.ColorTranslator]::FromHtml('#C6EFCE')) -ForegroundColor ([System.Drawing.ColorTranslator]::FromHtml('#006100'))
+                    Add-ConditionalFormatting -Worksheet $ws -Address $address -RuleType Expression `
+                        -ConditionValue "=AND(ISNUMBER($cell),$cell>50000,$cell<=250000)" -BackgroundColor ([System.Drawing.ColorTranslator]::FromHtml('#FFEB9C')) -ForegroundColor ([System.Drawing.ColorTranslator]::FromHtml('#9C6500'))
+                    Add-ConditionalFormatting -Worksheet $ws -Address $address -RuleType Expression `
+                        -ConditionValue "=AND(ISNUMBER($cell),$cell>250000,$cell<5000000)" -BackgroundColor ([System.Drawing.ColorTranslator]::FromHtml('#FCE4D6')) -ForegroundColor ([System.Drawing.ColorTranslator]::FromHtml('#C65911'))
+                    Add-ConditionalFormatting -Worksheet $ws -Address $address -RuleType Expression `
+                        -ConditionValue "=AND(ISNUMBER($cell),$cell>=5000000)" -BackgroundColor ([System.Drawing.ColorTranslator]::FromHtml('#FFC7CE')) -ForegroundColor ([System.Drawing.ColorTranslator]::FromHtml('#9C0006'))
                     break
                 }
             }
