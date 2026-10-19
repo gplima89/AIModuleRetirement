@@ -200,6 +200,43 @@ Get-Help .\Get-AIFoundryInventory.ps1 -Full
 - The Azure Monitor dimension-split query returns up to 500 series per account (`&top=500`), which comfortably covers typical deployment counts per account.
 - The script does not inspect your Azure RBAC role assignments up front; access gaps (missing Reader/Monitoring Reader) are instead discovered organically per tenant/subscription/account and reported as warnings with the specific failure, so the scan keeps going instead of aborting.
 
+## Troubleshooting
+
+### Fatal errors (stop the script)
+
+These occur during the pre-flight checks, before any scanning begins. Each one prints an actionable message; the fixes below summarize them.
+
+| Error | Likely cause | Fix |
+|---|---|---|
+| `Unsupported PowerShell version: ...` | Running on Windows PowerShell 5.0 or older. | Install PowerShell 7+ from https://aka.ms/powershell-release-current and re-run the script with `pwsh .\Get-AIFoundryInventory.ps1` (PowerShell 5.1 also works, but 7+ is recommended). |
+| `The following required module(s) could not be installed/imported: ...` | `Az.Accounts`, `Az.CognitiveServices`, `Az.ResourceGraph`, `Az.Resources`, `Az.Monitor`, or `ImportExcel` failed to auto-install or import — often due to no internet access to the PowerShell Gallery, a corporate proxy, lack of permission to write to the CurrentUser module path, or a conflicting module version already loaded in the session. | Run the suggested command manually for each listed module, e.g. `Install-Module -Name Az.CognitiveServices -Scope CurrentUser -Force`, then start a fresh PowerShell session and re-run the script. If you're behind a proxy, configure `$env:HTTPS_PROXY` or use `Register-PSRepository`/`Set-PSResourceRepository` as required by your network policy. |
+| `Azure sign-in failed: ...` | `Connect-AzAccount` was cancelled, timed out, or failed (e.g. MFA prompt not completed, no browser available in a headless/remote session). | Run `Connect-AzAccount` by itself first and confirm it completes successfully, then re-run the script. In a headless/remote session, use `Connect-AzAccount -UseDeviceAuthentication` and follow the device-code prompt. |
+| `Unable to establish an authenticated Azure session.` | `Connect-AzAccount` returned without error, but no usable account/context resulted (rare; usually an interrupted or partial sign-in). | Run `Disconnect-AzAccount` (if applicable) followed by `Connect-AzAccount`, confirm `Get-AzContext` shows a signed-in account, then re-run the script. |
+| `Could not enumerate Entra ID tenants for the signed-in account ...` | The signed-in identity has no network route to Azure AD, the account is disabled/locked, or it has zero role assignments anywhere in Azure. | Confirm you signed in with the intended account (`Get-AzContext`), check connectivity to `login.microsoftonline.com`/`management.azure.com`, and confirm the account has at least Reader on some subscription. |
+| `The signed-in account (...) has no accessible Entra ID tenants.` | The account authenticated successfully but isn't associated with any Entra ID tenant the Az SDK can see (e.g. a brand-new guest invite not yet accepted, or an account with no Azure role assignments at all). | Verify the account has at least Reader access to one subscription, or sign in with a different account via `Connect-AzAccount -Tenant <tenantId>`. |
+
+### Warnings (scan continues, data may be incomplete)
+
+These are printed to the console during the scan but do not stop the run. The report is still produced, but the affected tenant/subscription/account may be missing or incomplete — always check the console output for warnings before trusting a "clean" report.
+
+| Warning | Likely cause | Fix |
+|---|---|---|
+| `Could not retrieve model catalog for location '<region>': ...` | The regional model catalog lookup (`Get-AzCognitiveServicesModel`) failed — often a transient Azure API error or a region with no catalog data. | Re-run the script; if it persists for a specific region, confirm that region is valid and that your account has Cognitive Services Reader there. Affected deployments will show `UNKNOWN (not in catalog)`. |
+| `Could not list subscriptions for tenant <tenantId> with the current session. Trying interactive login for this tenant...` followed by `Skipping tenant <tenantId> - unable to authenticate or list subscriptions: ...` | Your current token doesn't have visibility into that tenant (common for guest/B2B accounts, especially with Conditional Access or MFA requirements specific to that tenant), and the automatic `Connect-AzAccount -Tenant <id>` retry also failed or was cancelled. | Run `Connect-AzAccount -Tenant <tenantId>` manually to confirm you can sign in to that tenant at all, and check with the tenant admin that your account has at least Reader access to a subscription there. If you don't need that tenant, scope the scan with `-TenantId` to exclude it. |
+| `Could not set context in tenant <tenantId> - ...` or `Could not switch context to subscription <subId>: ...` | `Set-AzContext` failed — the subscription may be disabled, moved, or the account lost access to it mid-run. | Confirm the subscription is still `Enabled` (`Get-AzSubscription`) and that your account retains Reader access; re-run the script. |
+| `Resource Graph query failed in tenant <tenantId> - ...` | Azure Resource Graph query failed for every subscription in that tenant, usually because the account has no Reader (or higher) role on any of them. | Grant the signed-in account Reader on at least one subscription in that tenant, or exclude it with `-TenantId`/`-SubscriptionId` if it's not in scope. |
+| `Could not list deployments for account <accountName>: ...` | The account lacks `Cognitive Services Reader` (or higher) on that specific Cognitive Services/Azure OpenAI account, even though the parent subscription is readable. | Grant `Cognitive Services Reader` (or higher) on the account, or expect that account's row(s) to show `No deployments` until access is fixed. |
+| Token usage columns are unexpectedly `0` for an account/deployment you know is active (no warning text; check with `-Verbose`) | The signed-in account lacks `Monitoring Reader` (or higher) on that Cognitive Services account, the account's kind doesn't emit the `TotalTokens` metric (e.g. `ContentSafety`), or the deployment had no traffic in the last 28 days. | Grant `Monitoring Reader` on the account and re-run with `-Verbose` to see the specific `Could not retrieve token usage for <resourceId> : ...` message (shown only at Verbose level), which distinguishes a permissions/API error from genuinely zero usage. |
+
+### Other common issues
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| The script runs but the `.xlsx` is empty or shows "No Cognitive Services / AI Foundry accounts or deployments were found in the scanned scope." | No `Microsoft.CognitiveServices/accounts` were discovered in the scanned tenants/subscriptions, or the account has Reader access to none of them. | Confirm the expected resources exist in the scope you're targeting (check the Azure Portal), and scope the run explicitly with `-TenantId`/`-SubscriptionId` to rule out an overly broad/narrow default scan. |
+| `Export-Excel`/`Close-ExcelPackage` fails with a file-in-use or access-denied error. | The target `.xlsx` (default or `-OutputPath`) is already open in Excel, or the folder is read-only/OneDrive-locked. | Close the file in Excel before re-running, or pass a different `-OutputPath`. |
+| The run takes a very long time. | Token-usage lookups and model-catalog calls add an Azure API round-trip per account/region, which adds up across large tenants with many accounts. | Use `-SkipTokenUsage` and/or `-SkipWorkspaces` for a faster pass when you don't need usage/workspace data, or scope the run with `-TenantId`/`-SubscriptionId`. |
+| PowerShell prompts to trust the PSGallery repository or shows SSL/TLS errors during module install. | PSGallery isn't yet configured as a trusted repository, or the machine's TLS settings are outdated. | Run `Set-PSRepository -Name PSGallery -InstallationPolicy Trusted` once, and ensure `[Net.ServicePointManager]::SecurityProtocol` includes `Tls12` (default on PowerShell 7+). |
+
 ## License
 
 [MIT](./LICENSE)
