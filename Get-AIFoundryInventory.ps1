@@ -22,7 +22,8 @@
          (high-token-volume deployments on a retiring model are higher priority to migrate).
       5. Produces an Excel workbook with three sheets:
            - "Model Deployments"       : one row per deployment with full retirement detail + weekly token usage
-           - "Hub-Project Workspaces"  : one row per Foundry Hub/Project workspace found
+                                         + the parent account's Azure tags ("Tags" and one "Tag: <key>" column per key)
+           - "Hub-Project Workspaces"  : one row per Foundry Hub/Project workspace found (including its tags)
            - "Summary"                 : counts by retirement flag / tenant / subscription
 
 .PARAMETER TenantId
@@ -47,6 +48,11 @@
     Skip the per-deployment weekly token-consumption lookup (Azure Monitor "TotalTokens" metric). Use this
     to speed up the scan if you only need retirement status, not usage/impact data.
 
+.PARAMETER TagKeys
+    Azure tag keys (case-insensitive) to expand into their own "Tag: <key>" columns, e.g. CostCenter,
+    BusinessUnit, Owner. Default: every tag key found on the exported resources gets its own column.
+    Regardless of this filter, the "Tags" column always lists ALL tags of the resource as "key=value; ...".
+
 .EXAMPLE
     .\Get-AIFoundryInventory.ps1
     Scans every tenant/subscription you can access and writes a report next to the script.
@@ -56,6 +62,10 @@
 
 .EXAMPLE
     .\Get-AIFoundryInventory.ps1 -SubscriptionId '11111111-1111-1111-1111-111111111111' -RetirementWarningDays 60
+
+.EXAMPLE
+    .\Get-AIFoundryInventory.ps1 -TagKeys CostCenter, BusinessUnit, Owner
+    Adds only the CostCenter, BusinessUnit and Owner tags as dedicated columns (all tags still appear in "Tags").
 
 .NOTES
     Requires: Az.Accounts, Az.CognitiveServices, Az.ResourceGraph, Az.Resources, Az.Monitor, ImportExcel
@@ -74,7 +84,8 @@ param(
     [string] $OutputPath = (Join-Path -Path $PSScriptRoot -ChildPath ("AI-Foundry-Inventory-{0}.xlsx" -f (Get-Date -Format 'yyyyMMdd-HHmmss'))),
     [int] $RetirementWarningDays = 90,
     [switch] $SkipWorkspaces,
-    [switch] $SkipTokenUsage
+    [switch] $SkipTokenUsage,
+    [string[]] $TagKeys
 )
 
 $ErrorActionPreference = 'Stop'
@@ -274,6 +285,91 @@ function Get-AccountWeeklyTokenUsage {
     }
     return $usage
 }
+
+$script:ExcelCellMaxLength = 32767
+$script:TagColumnPrefix = 'Tag: '
+
+function ConvertTo-TagMap {
+    <#
+    Converts the "tags" value returned by Resource Graph (PSCustomObject, hashtable or $null) into an
+    ordered, case-insensitive dictionary of key -> string value. Azure tag keys are case-insensitive.
+    #>
+    param($Tags)
+    $map = [System.Collections.Specialized.OrderedDictionary]::new([System.StringComparer]::OrdinalIgnoreCase)
+    if ($null -eq $Tags) { return , $map }
+    $pairs = if ($Tags -is [System.Collections.IDictionary]) {
+        foreach ($k in $Tags.Keys) { [pscustomobject]@{ Name = [string]$k; Value = $Tags[$k] } }
+    } else {
+        foreach ($p in $Tags.PSObject.Properties) { [pscustomobject]@{ Name = $p.Name; Value = $p.Value } }
+    }
+    foreach ($pair in $pairs) {
+        if (-not $map.Contains($pair.Name)) { $map[$pair.Name] = if ($null -eq $pair.Value) { '' } else { [string]$pair.Value } }
+    }
+    return , $map
+}
+
+function ConvertTo-ExcelLiteral {
+    <# Keeps a value as literal text in Excel: ImportExcel turns strings starting with '=' into formulas. #>
+    param([string] $Value)
+    if ([string]::IsNullOrEmpty($Value)) { return $Value }
+    if ($Value[0] -eq '=') { $Value = "'$Value" }
+    if ($Value.Length -gt $script:ExcelCellMaxLength) {
+        $marker = ' ...[TRUNCATED]'
+        $Value = $Value.Substring(0, $script:ExcelCellMaxLength - $marker.Length) + $marker
+    }
+    return $Value
+}
+
+function Add-TagColumns {
+    <#
+    Replaces the internal "_TagMap" property on each row with:
+      - "Tags"          : every tag on the resource as "key=value; key=value" (sorted by key)
+      - "Tag: <key>"    : one column per tag key ($TagKeys, or the union of keys found on the rows)
+    Every output row gets the same set of columns, because Export-Excel derives headers from the first row.
+    Returns @{ Rows = <list>; TagColumnNames = <string[]> }.
+    #>
+    param(
+        [Parameter(Mandatory)] [AllowEmptyCollection()] [System.Collections.Generic.List[object]] $Rows,
+        [string[]] $SelectedKeys
+    )
+    $keys = [System.Collections.Generic.List[string]]::new()
+    $seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    if ($SelectedKeys) {
+        foreach ($k in $SelectedKeys) { if ($k -and $seen.Add($k)) { $keys.Add($k) } }
+    } else {
+        foreach ($r in $Rows) { foreach ($k in $r._TagMap.Keys) { if ($seen.Add($k)) { $keys.Add($k) } } }
+        $keys.Sort([System.StringComparer]::OrdinalIgnoreCase)
+    }
+
+    $out = [System.Collections.Generic.List[object]]::new()
+    foreach ($r in $Rows) {
+        $tagMap = $r._TagMap
+        $newRow = [ordered]@{}
+        foreach ($p in $r.PSObject.Properties) { if ($p.Name -ne '_TagMap') { $newRow[$p.Name] = $p.Value } }
+        $tagText = ($tagMap.Keys | Sort-Object | ForEach-Object { '{0}={1}' -f $_, $tagMap[$_] }) -join '; '
+        $newRow['Tags'] = ConvertTo-ExcelLiteral -Value $tagText
+        foreach ($k in $keys) {
+            $newRow["$($script:TagColumnPrefix)$k"] = if ($tagMap.Contains($k)) { ConvertTo-ExcelLiteral -Value $tagMap[$k] } else { $null }
+        }
+        $out.Add([pscustomobject]$newRow)
+    }
+    return @{
+        Rows           = $out
+        TagColumnNames = @('Tags') + @($keys | ForEach-Object { "$($script:TagColumnPrefix)$_" })
+    }
+}
+
+function Set-ColumnMaxWidth {
+    <# Caps the width of a column (found by header text) so a long "Tags" value doesn't make the sheet unreadable. #>
+    param($Worksheet, [string] $Header, [double] $MaxWidth = 80)
+    if (-not $Worksheet.Dimension) { return }
+    for ($c = 1; $c -le $Worksheet.Dimension.End.Column; $c++) {
+        if ($Worksheet.Cells[1, $c].Text -eq $Header) {
+            if ($Worksheet.Column($c).Width -gt $MaxWidth) { $Worksheet.Column($c).Width = $MaxWidth }
+            return
+        }
+    }
+}
 #endregion
 
 #region Determine tenants to scan
@@ -370,6 +466,7 @@ foreach ($tenant in $tenantsToScan) {
 
         $acctProjects = if ($projectsByAccount.ContainsKey($acct.name)) { $projectsByAccount[$acct.name] } else { @() }
         $projectNames = ($acctProjects | ForEach-Object { (($_.name -split '/')[1]) }) -join '; '
+        $acctTagMap   = ConvertTo-TagMap -Tags $acct.tags
 
         Write-Host "    Account: $($acct.name) [$($acct.kind)] - $($acct.resourceGroup)" -ForegroundColor Gray
 
@@ -413,6 +510,7 @@ foreach ($tenant in $tenantsToScan) {
             foreach ($wk in $script:TokenWeekRanges) { $noUsageRow[$wk.Label] = $null }
             $noUsageRow['Total4WeekTokens'] = $null
             $noUsageRow['Note'] = $null
+            $noUsageRow['_TagMap'] = $acctTagMap
             $deploymentResults.Add([pscustomobject]$noUsageRow)
             continue
         }
@@ -479,6 +577,7 @@ foreach ($tenant in $tenantsToScan) {
             for ($i = 0; $i -lt $script:TokenWeekRanges.Count; $i++) { $row[$script:TokenWeekRanges[$i].Label] = $weeklyTokens[$i] }
             $row['Total4WeekTokens'] = ($weeklyTokens | Measure-Object -Sum).Sum
             $row['Note'] = $catalogNote
+            $row['_TagMap'] = $acctTagMap
 
             $deploymentResults.Add([pscustomobject]$row)
         }
@@ -500,6 +599,7 @@ foreach ($tenant in $tenantsToScan) {
                 Location         = $ws.location
                 CreatedOn        = $ws.systemData.createdAt
                 LastModifiedOn   = $ws.systemData.lastModifiedAt
+                _TagMap          = ConvertTo-TagMap -Tags $ws.tags
             })
         }
     }
@@ -509,6 +609,13 @@ foreach ($tenant in $tenantsToScan) {
 Write-Host "`nWriting report to: $OutputPath" -ForegroundColor Cyan
 
 if (Test-Path -Path $OutputPath) { Remove-Item -Path $OutputPath -Force }
+
+# Expand resource tags into a "Tags" column plus one "Tag: <key>" column per key. Tag columns are written as
+# literal text (no number/hyperlink conversion) so values like cost center "00123" keep their leading zeros.
+$deploymentTagExpansion = Add-TagColumns -Rows $deploymentResults -SelectedKeys $TagKeys
+$deploymentResults      = $deploymentTagExpansion.Rows
+$workspaceTagExpansion  = Add-TagColumns -Rows $workspaceResults -SelectedKeys $TagKeys
+$workspaceResults       = $workspaceTagExpansion.Rows
 
 $ctRetired      = New-ConditionalText -Text 'RETIRED'        -BackgroundColor '#FFC7CE' -ConditionalTextColor '#9C0006'
 $ctSoon         = New-ConditionalText -Text 'RETIRING SOON'  -BackgroundColor '#FFEB9C' -ConditionalTextColor '#9C6500'
@@ -520,10 +627,12 @@ $ctOk           = New-ConditionalText -Text 'OK'             -BackgroundColor '#
 if ($deploymentResults.Count -gt 0) {
     $excelPkg = $deploymentResults | Sort-Object Tenant, SubscriptionName, AccountName, DeploymentName |
         Export-Excel -Path $OutputPath -WorksheetName 'Model Deployments' -AutoSize -FreezeTopRow -BoldTopRow -AutoFilter -TableStyle Medium2 `
+            -NoNumberConversion $deploymentTagExpansion.TagColumnNames -NoHyperLinkConversion $deploymentTagExpansion.TagColumnNames `
             -ConditionalText @($ctRetired, $ctSoon, $ctDeprecating, $ctLegacy, $ctUnknown, $ctOk) -PassThru
 
     # Use fixed token bands so colors are consistent across weekly/total columns and reports.
     $ws = $excelPkg.Workbook.Worksheets['Model Deployments']
+    Set-ColumnMaxWidth -Worksheet $ws -Header 'Tags'
     $lastRow = $ws.Dimension.End.Row
     $lastCol = $ws.Dimension.End.Column
     $tokenColumnNames = @($script:TokenWeekRanges.Label) + 'Total4WeekTokens'
@@ -555,8 +664,11 @@ if ($deploymentResults.Count -gt 0) {
 
 if (-not $SkipWorkspaces) {
     if ($workspaceResults.Count -gt 0) {
-        $workspaceResults | Sort-Object Tenant, SubscriptionName, WorkspaceName |
-            Export-Excel -Path $OutputPath -WorksheetName 'Hub-Project Workspaces' -AutoSize -FreezeTopRow -BoldTopRow -AutoFilter -TableStyle Medium3
+        $wsPkg = $workspaceResults | Sort-Object Tenant, SubscriptionName, WorkspaceName |
+            Export-Excel -Path $OutputPath -WorksheetName 'Hub-Project Workspaces' -AutoSize -FreezeTopRow -BoldTopRow -AutoFilter -TableStyle Medium3 `
+                -NoNumberConversion $workspaceTagExpansion.TagColumnNames -NoHyperLinkConversion $workspaceTagExpansion.TagColumnNames -PassThru
+        Set-ColumnMaxWidth -Worksheet $wsPkg.Workbook.Worksheets['Hub-Project Workspaces'] -Header 'Tags'
+        Close-ExcelPackage -ExcelPackage $wsPkg
     } else {
         [pscustomobject]@{ Message = 'No Microsoft.MachineLearningServices/workspaces (Hub/Project) were found in the scanned scope.' } |
             Export-Excel -Path $OutputPath -WorksheetName 'Hub-Project Workspaces' -AutoSize -BoldTopRow
@@ -570,15 +682,21 @@ $summaryByTenant = $deploymentResults | Group-Object Tenant, SubscriptionName |
 $impactFlags = @('RETIRED', 'RETIRING SOON', 'DEPRECATING', 'LEGACY')
 $impactRanking = $deploymentResults | Where-Object { $_.RetirementFlag -in $impactFlags -and $null -ne $_.Total4WeekTokens } |
     Sort-Object Total4WeekTokens -Descending | Select-Object -First 25 |
-    Select-Object Tenant, SubscriptionName, AccountName, DeploymentName, ModelName, ModelVersion, RetirementFlag, DaysUntilRetirement, Total4WeekTokens
+    Select-Object Tenant, SubscriptionName, AccountName, DeploymentName, ModelName, ModelVersion, RetirementFlag, DaysUntilRetirement, Total4WeekTokens, Tags
 
 if ($summary.Count -gt 0) {
     $summary | Export-Excel -Path $OutputPath -WorksheetName 'Summary' -AutoSize -BoldTopRow -Title 'Retirement status summary' -TitleBold -StartRow 1
     $summaryByTenant | Export-Excel -Path $OutputPath -WorksheetName 'Summary' -AutoSize -BoldTopRow -Title 'Deployments by tenant/subscription' -TitleBold -StartRow ($summary.Count + 4)
     if ($impactRanking.Count -gt 0) {
         $impactStartRow = $summary.Count + $summaryByTenant.Count + 8
-        $impactRanking | Export-Excel -Path $OutputPath -WorksheetName 'Summary' -AutoSize -BoldTopRow `
-            -Title 'Highest-impact retiring/deprecating/legacy deployments (by 4-week token volume)' -TitleBold -StartRow $impactStartRow
+        $summaryPkg = $impactRanking | Export-Excel -Path $OutputPath -WorksheetName 'Summary' -AutoSize -BoldTopRow `
+            -NoNumberConversion 'Tags' -NoHyperLinkConversion 'Tags' `
+            -Title 'Highest-impact retiring/deprecating/legacy deployments (by 4-week token volume)' -TitleBold -StartRow $impactStartRow -PassThru
+        # "Tags" is the last column of the impact-ranking table; cap its auto-sized width.
+        $summaryWs = $summaryPkg.Workbook.Worksheets['Summary']
+        $tagsCol = @($impactRanking[0].PSObject.Properties.Name).IndexOf('Tags') + 1
+        if ($tagsCol -gt 0 -and $summaryWs.Column($tagsCol).Width -gt 80) { $summaryWs.Column($tagsCol).Width = 80 }
+        Close-ExcelPackage -ExcelPackage $summaryPkg
     }
 }
 #endregion

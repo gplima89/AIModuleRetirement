@@ -16,8 +16,8 @@ For every accessible tenant and subscription (or the ones you specify), the scri
 3. Looks up the regional **model catalog** (`Get-AzCognitiveServicesModel`) to get each model's `LifecycleStatus` and `Deprecation` (retirement) dates for inference and fine-tuning.
 4. Pulls the Azure Monitor **`TotalTokens`** metric (prompt + completion tokens) for each deployment, split into the last 4 individual weeks, so high-volume deployments on a retiring model can be prioritized for migration.
 5. Produces an **Excel workbook** with up to three sheets:
-   - **Model Deployments** — one row per deployment: tenant, subscription, resource group, account, Foundry project, location, creation dates, model name/version/format, SKU/capacity, lifecycle status, retirement dates, days-until-retirement, retirement flag, 4 weekly token columns, 4-week total, and notes. Conditionally formatted — red/yellow/green by retirement flag, and fixed color bands on all weekly token columns and the 4-week total: **green** for 0–50,000, **yellow** for >50,000–250,000, **orange** for >250,000–<5,000,000, and **red** for 5,000,000+. Blank and nonnumeric token cells are not colored.
-   - **Hub-Project Workspaces** — one row per classic AI Foundry Hub/Project workspace found.
+   - **Model Deployments** — one row per deployment: tenant, subscription, resource group, account, Foundry project, location, creation dates, model name/version/format, SKU/capacity, lifecycle status, retirement dates, days-until-retirement, retirement flag, 4 weekly token columns, 4-week total, notes, and the account's Azure **tags** (a combined `Tags` column plus one `Tag: <key>` column per key — useful for cost center, business unit, owner, etc.). Conditionally formatted — red/yellow/green by retirement flag, and fixed color bands on all weekly token columns and the 4-week total: **green** for 0–50,000, **yellow** for >50,000–250,000, **orange** for >250,000–<5,000,000, and **red** for 5,000,000+. Blank and nonnumeric token cells are not colored.
+   - **Hub-Project Workspaces** — one row per classic AI Foundry Hub/Project workspace found, including its tags.
    - **Summary** — counts by retirement flag, counts by tenant/subscription, and a ranked list of the highest-impact retiring/deprecating/legacy deployments by 4-week token volume.
 
 ## Prerequisites
@@ -70,9 +70,9 @@ The script reads Azure inventory, catalog, and metric data; it does **not** upgr
 
 | Worksheet | Layout | How to use it |
 |---|---|---|
-| **Model Deployments** | A wide, filterable table with bold headers, a frozen top row, and one row per model deployment. Rows are initially sorted by tenant, subscription, account, and deployment name. | Your detailed investigation view: filter by retirement flag, locate the deployment, and compare deadlines with usage. Accounts without listed deployments have a placeholder row instead. |
-| **Hub-Project Workspaces** | A separate inventory table with tenant/subscription, resource group, workspace name/kind, location, and creation/modification dates. | Locate classic Hub/Project workspaces. This sheet does not contain model-retirement or token-usage assessments. It is omitted with `-SkipWorkspaces`. |
-| **Summary** | Stacked sections for retirement-status counts, tenant/subscription counts, and up to 25 affected deployments ranked by 4-week tokens. | Start here for a quick overview and a shortlist for migration planning, then find the corresponding rows in **Model Deployments**. |
+| **Model Deployments** | A wide, filterable table with bold headers, a frozen top row, and one row per model deployment. Rows are initially sorted by tenant, subscription, account, and deployment name. The last columns hold the account's Azure tags (`Tags` plus one `Tag: <key>` column per tag key). | Your detailed investigation view: filter by retirement flag, locate the deployment, and compare deadlines with usage. Filter on `Tag: …` columns (e.g. `Tag: CostCenter`, `Tag: BusinessUnit`) to route work to the right owner. Accounts without listed deployments have a placeholder row instead. |
+| **Hub-Project Workspaces** | A separate inventory table with tenant/subscription, resource group, workspace name/kind, location, creation/modification dates, and the workspace's Azure tags. | Locate classic Hub/Project workspaces. This sheet does not contain model-retirement or token-usage assessments. It is omitted with `-SkipWorkspaces`. |
+| **Summary** | Stacked sections for retirement-status counts, tenant/subscription counts, and up to 25 affected deployments ranked by 4-week tokens (including their `Tags`). | Start here for a quick overview and a shortlist for migration planning, then find the corresponding rows in **Model Deployments**. |
 
 If no accounts or deployments are found in the scanned scope, **Model Deployments** contains an explanatory message and **Summary** is not created. If workspace discovery runs but finds nothing, its sheet also contains a message.
 
@@ -88,8 +88,20 @@ If no accounts or deployments are found in the scanned scope, **Model Deployment
 | Lifecycle and deadlines | `LifecycleStatus`, `InferenceRetirement`, `FineTuneRetirement`, `DaysUntilRetirement`, `RetirementFlag` | Distinguish the catalog lifecycle from the script's calculated urgency flag. Inference retirement drives the deadline assessment; fine-tuning retirement is shown separately for reference. |
 | Usage | Four `Wk… Tokens (…)` columns and `Total4WeekTokens` | Assess recent activity and relative migration impact, using the time windows and caveats below. |
 | Data qualification | `Note` | Read this before acting on retirement dates. It identifies cases where the exact deployed version was absent and another catalog version was used. |
+| Ownership / chargeback | `Tags`, `Tag: <key>` columns | Identify cost center, business unit, owner, environment, etc. See [Resource tags](#resource-tags) below. |
 
 `DaysUntilRetirement` is the rounded number of days between the run time and the inference-retirement date: positive means ahead, negative means past, and blank means no inference date was available. A value of `0` can mean slightly before or after the deadline because of rounding; the flag uses the unrounded interval.
+
+### Resource tags
+
+Azure tags (for example `CostCenter`, `BusinessUnit`, `Owner`, `Environment`) are exported so each row can be attributed to an owner or chargeback unit:
+
+- **`Tags`** lists every tag on the resource as `key=value; key=value`, sorted by key.
+- **`Tag: <key>`** columns contain one tag each, ready for filtering/pivoting. By default a column is created for every tag key found in the scanned scope; use `-TagKeys CostCenter, BusinessUnit` to create columns only for the keys you care about (the `Tags` column still lists all tags).
+- On **Model Deployments**, tags come from the parent **Cognitive Services / AI Foundry account**, so all deployments of the same account show the same tags. On **Hub-Project Workspaces**, they are the workspace's own tags.
+- Only tags set directly on the resource are shown. Resource-group or subscription tags are **not** inherited into the report (unless your Azure Policy copies them onto the resource). A blank tag cell means the resource doesn't have that tag.
+- Tag keys are matched case-insensitively (as Azure does), so `CostCenter` and `costcenter` share one column, using the casing first seen.
+- Tag values are written as literal text: leading zeros are preserved (e.g. cost center `00123`), URLs are not turned into hyperlinks, and a value starting with `=` is prefixed with `'` so Excel doesn't evaluate it as a formula. Values longer than Excel's 32,767-character cell limit are truncated with a `...[TRUNCATED]` marker.
 
 ### Interpreting retirement flags
 
@@ -163,6 +175,7 @@ The console finishes with row/workspace counts and the workbook path, warns if r
 | `-RetirementWarningDays` | `int` | `90` | Number of days before a model's inference retirement date to flag it as `RETIRING SOON`. |
 | `-SkipWorkspaces` | `switch` | off | Skip discovery of `Microsoft.MachineLearningServices/workspaces` (Hub/Project workspaces). Speeds up the scan if you only care about Azure OpenAI / Cognitive Services deployments. |
 | `-SkipTokenUsage` | `switch` | off | Skip the per-deployment weekly token-consumption lookup. Speeds up the scan if you only need retirement status, not usage/impact data. |
+| `-TagKeys` | `string[]` | all tag keys found | Tag keys (case-insensitive) to expand into dedicated `Tag: <key>` columns, e.g. `CostCenter, BusinessUnit, Owner`. The `Tags` column always lists all tags. |
 
 Full parameter documentation is also available via:
 
@@ -184,11 +197,14 @@ Get-Help .\Get-AIFoundryInventory.ps1 -Full
 
 # Faster scan: skip Hub/Project workspace discovery and token-usage lookups
 .\Get-AIFoundryInventory.ps1 -SkipWorkspaces -SkipTokenUsage
+
+# Only create dedicated columns for the chargeback tags (all tags still appear in the "Tags" column)
+.\Get-AIFoundryInventory.ps1 -TagKeys CostCenter, BusinessUnit, Owner
 ```
 
 ## Output columns (Model Deployments sheet)
 
-`Tenant`, `TenantId`, `SubscriptionName`, `SubscriptionId`, `ResourceGroup`, `AccountName`, `AccountKind`, `FoundryProject`, `Location`, `AccountCreatedOn`, `DeploymentName`, `ModelName`, `ModelVersion`, `ModelFormat`, `SkuName`, `Capacity`, `ProvisioningState`, `DeploymentCreatedOn`, `DeploymentModifiedOn`, `LifecycleStatus`, `InferenceRetirement`, `FineTuneRetirement`, `DaysUntilRetirement`, `RetirementFlag`, **`Wk1 Tokens (…)` … `Wk4 Tokens (…)`**, `Total4WeekTokens`, `Note`.
+`Tenant`, `TenantId`, `SubscriptionName`, `SubscriptionId`, `ResourceGroup`, `AccountName`, `AccountKind`, `FoundryProject`, `Location`, `AccountCreatedOn`, `DeploymentName`, `ModelName`, `ModelVersion`, `ModelFormat`, `SkuName`, `Capacity`, `ProvisioningState`, `DeploymentCreatedOn`, `DeploymentModifiedOn`, `LifecycleStatus`, `InferenceRetirement`, `FineTuneRetirement`, `DaysUntilRetirement`, `RetirementFlag`, **`Wk1 Tokens (…)` … `Wk4 Tokens (…)`**, `Total4WeekTokens`, `Note`, `Tags`, **`Tag: <key>` …** (one per tag key).
 
 `RetirementFlag` values: `OK`, `PREVIEW`, `LEGACY`, `DEPRECATING`, `RETIRING SOON`, `RETIRED`, `UNKNOWN (not in catalog)`, `No deployments`.
 
